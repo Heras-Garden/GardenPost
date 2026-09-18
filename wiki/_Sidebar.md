@@ -1,0 +1,1 @@
+- [Home](Home)\n- [How It Works](How-It-Works)\n- [Commands](Commands)\n- [Configuration](Configuration)\n- [Testing](Testing)\n
