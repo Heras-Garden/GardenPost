@@ -1,0 +1,21 @@
+name: GardenPost
+version: '${project.version}'
+main: com.herasgarden.gardenpost.GardenPost
+api-version: '26.2'
+author: Hera's Garden
+website: https://herasgarden.net
+description: Physical mail and courier delivery for The Garden SMP.
+depend: [GardenCore, GardenLands]
+
+commands:
+  mail:
+    description: Send and deliver Garden mail.
+    usage: /mail <send|status|primary|route|routes>
+
+permissions:
+  gardenpost.mail:
+    default: true
+  gardenpost.mailman:
+    default: false
+  gardenpost.admin:
+    default: op

@@ -1,0 +1,29 @@
+name: Build GardenPost
+
+on:
+  push:
+    branches: [main, 'feature/**']
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Heras-Garden/GardenCore
+          path: GardenCore-source
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+      - name: Install GardenCore
+        run: mvn -B -f GardenCore-source/pom.xml install -DskipTests
+      - name: Build
+        run: mvn -B clean package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GardenPost
+          path: target/GardenPost-*.jar

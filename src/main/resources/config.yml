@@ -1,0 +1,6 @@
+postage:
+  letter-cost: 2
+
+courier:
+  base-reward: 3
+  assignment-timeout-minutes: 30
