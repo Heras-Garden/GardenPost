@@ -47,6 +47,11 @@ public final class GardenPost extends JavaPlugin {
         long courierReward = Math.max(0L, getConfig().getLong("courier.base-reward", 3L));
         long timeoutMinutes = Math.max(1L, getConfig().getLong("courier.assignment-timeout-minutes", 30L));
         mailService = new MailService(this, platform, properties, postage, courierReward, timeoutMinutes * 60_000L);
+        try {
+            mailService.recoverInterruptedDeliveries();
+        } catch (SQLException exception) {
+            getLogger().warning("Interrupted mail delivery recovery could not complete: " + exception.getMessage());
+        }
 
         MailCommand mailCommand = new MailCommand(mailService);
         PluginCommand mail = getCommand("mail");

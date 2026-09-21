@@ -1,6 +1,6 @@
 # GardenPost
 
-Physical mail, mailboxes, parcels, and courier delivery for The Garden SMP.
+Physical letters, registered mailboxes, and courier delivery for The Garden SMP.
 
 ## Requirements
 

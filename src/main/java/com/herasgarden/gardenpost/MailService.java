@@ -164,11 +164,18 @@ public final class MailService {
         try {
             insert(record);
         } catch (SQLException exception) {
-            platform.currency().deposit(sender.getUniqueId(), postageCost);
+            boolean refunded = platform.currency().deposit(sender.getUniqueId(), postageCost);
             try {
-                platform.orders().transition(order.id(), OrderState.REFUNDED,
-                        "Mail creation failed and postage was returned");
+                platform.orders().transition(order.id(),
+                        refunded ? OrderState.REFUNDED : OrderState.FULFILLMENT_FAILED,
+                        refunded
+                                ? "Mail creation failed and postage was returned"
+                                : "Mail creation failed and postage refund requires admin review");
             } catch (Exception ignored) {
+            }
+            if (!refunded) {
+                plugin.getLogger().severe("Postage refund failed for order " + order.id()
+                        + " and sender " + sender.getUniqueId() + "; admin review is required.");
             }
             throw exception;
         }
@@ -289,23 +296,45 @@ public final class MailService {
             return DeliveryResult.failure("The destination mailbox is missing.");
         }
 
-        ItemStack letter = deliveredLetter(record);
-        Map<Integer, ItemStack> leftovers = container.getInventory().addItem(letter);
-        if (!leftovers.isEmpty()) {
-            return DeliveryResult.failure("That mailbox is full.");
-        }
-
         long now = System.currentTimeMillis();
         try (Connection connection = platform.storage().connection();
              PreparedStatement statement = connection.prepareStatement(
-                     "UPDATE gp_mail SET status = 'DELIVERED', delivered_at = ? "
-                             + "WHERE mail_uuid = ? AND status = 'ASSIGNED'")) {
-            statement.setLong(1, now);
-            statement.setString(2, record.id().toString());
+                     "UPDATE gp_mail SET status = 'DELIVERING' WHERE mail_uuid = ? AND status = 'ASSIGNED'")) {
+            statement.setString(1, record.id().toString());
             if (statement.executeUpdate() != 1) {
-                container.getInventory().removeItem(letter);
-                return DeliveryResult.failure("The delivery changed before it could be completed.");
+                return DeliveryResult.failure("The delivery changed before it could be reserved.");
             }
+        }
+
+        ItemStack letter = deliveredLetter(record);
+        Map<Integer, ItemStack> leftovers = container.getInventory().addItem(letter);
+        if (!leftovers.isEmpty()) {
+            revertDelivering(record.id());
+            return DeliveryResult.failure("That mailbox is full.");
+        }
+
+        try {
+            try (Connection connection = platform.storage().connection();
+                 PreparedStatement statement = connection.prepareStatement(
+                         "UPDATE gp_mail SET status = 'DELIVERED', delivered_at = ? "
+                                 + "WHERE mail_uuid = ? AND status = 'DELIVERING'")) {
+                statement.setLong(1, now);
+                statement.setString(2, record.id().toString());
+                if (statement.executeUpdate() != 1) {
+                    removeOneDeliveredLetter(container, record.id());
+                    revertDelivering(record.id());
+                    return DeliveryResult.failure("The delivery changed before it could be completed.");
+                }
+            }
+        } catch (SQLException exception) {
+            removeOneDeliveredLetter(container, record.id());
+            try {
+                revertDelivering(record.id());
+            } catch (SQLException recoveryFailure) {
+                plugin.getLogger().severe("Mail " + record.id()
+                        + " could not be reverted from DELIVERING after DB failure: " + recoveryFailure.getMessage());
+            }
+            throw exception;
         }
 
         boolean rewardPaid = false;
@@ -352,6 +381,87 @@ public final class MailService {
         }
 
         return DeliveryResult.delivered(rewardPaid ? courierReward : 0L, platform.currency().symbol());
+    }
+
+    public void recoverInterruptedDeliveries() throws SQLException {
+        List<MailRecord> recovering = new ArrayList<>();
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT * FROM gp_mail WHERE status = 'DELIVERING'");
+             ResultSet result = statement.executeQuery()) {
+            while (result.next()) recovering.add(read(result));
+        }
+
+        for (MailRecord record : recovering) {
+            org.bukkit.World world = Bukkit.getWorld(record.mailboxWorldId());
+            if (world == null) {
+                plugin.getLogger().warning("Mail " + record.id() + " remains DELIVERING because its world is unavailable.");
+                continue;
+            }
+            Block block = world.getBlockAt(record.mailboxX(), record.mailboxY(), record.mailboxZ());
+            if (!(block.getState() instanceof Container container)) {
+                revertDelivering(record.id());
+                continue;
+            }
+
+            int copies = countDeliveredLetters(container, record.id());
+            if (copies <= 0) {
+                revertDelivering(record.id());
+                continue;
+            }
+            while (copies > 1) {
+                if (!removeOneDeliveredLetter(container, record.id())) break;
+                copies--;
+            }
+            try (Connection connection = platform.storage().connection();
+                 PreparedStatement statement = connection.prepareStatement(
+                         "UPDATE gp_mail SET status = 'DELIVERED', delivered_at = COALESCE(delivered_at, ?) "
+                                 + "WHERE mail_uuid = ? AND status = 'DELIVERING'")) {
+                statement.setLong(1, System.currentTimeMillis());
+                statement.setString(2, record.id().toString());
+                statement.executeUpdate();
+            }
+        }
+    }
+
+    private void revertDelivering(UUID mailId) throws SQLException {
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "UPDATE gp_mail SET status = 'ASSIGNED' WHERE mail_uuid = ? AND status = 'DELIVERING'")) {
+            statement.setString(1, mailId.toString());
+            statement.executeUpdate();
+        }
+    }
+
+    private int countDeliveredLetters(Container container, UUID mailId) {
+        int count = 0;
+        for (ItemStack item : container.getInventory().getContents()) {
+            if (deliveredMailId(item).filter(mailId::equals).isPresent()) count += item.getAmount();
+        }
+        return count;
+    }
+
+    private boolean removeOneDeliveredLetter(Container container, UUID mailId) {
+        ItemStack[] contents = container.getInventory().getContents();
+        for (int slot = 0; slot < contents.length; slot++) {
+            ItemStack item = contents[slot];
+            if (deliveredMailId(item).filter(mailId::equals).isEmpty()) continue;
+            if (item.getAmount() <= 1) container.getInventory().setItem(slot, null);
+            else item.setAmount(item.getAmount() - 1);
+            return true;
+        }
+        return false;
+    }
+
+    private Optional<UUID> deliveredMailId(ItemStack item) {
+        if (item == null || !item.hasItemMeta()) return Optional.empty();
+        String raw = item.getItemMeta().getPersistentDataContainer().get(deliveredKey, PersistentDataType.STRING);
+        if (raw == null) return Optional.empty();
+        try {
+            return Optional.of(UUID.fromString(raw));
+        } catch (IllegalArgumentException ignored) {
+            return Optional.empty();
+        }
     }
 
     private ItemStack deliveredLetter(MailRecord record) {
