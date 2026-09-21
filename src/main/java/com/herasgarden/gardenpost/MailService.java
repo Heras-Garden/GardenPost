@@ -327,13 +327,15 @@ public final class MailService {
                 }
             }
         } catch (SQLException exception) {
-            removeOneDeliveredLetter(container, record.id());
-            try {
-                revertDelivering(record.id());
-            } catch (SQLException recoveryFailure) {
-                plugin.getLogger().severe("Mail " + record.id()
-                        + " could not be reverted from DELIVERING after DB failure: " + recoveryFailure.getMessage());
-            }
+            /*
+             * The UPDATE outcome is ambiguous when the connection fails. Keep the exact PDC
+             * letter in place and leave the durable state for startup reconciliation. If the
+             * UPDATE committed, DELIVERED + one physical copy is already correct. If it did
+             * not, DELIVERING is recovered on restart without creating another copy.
+             */
+            plugin.getLogger().warning("Mail " + record.id()
+                    + " hit an ambiguous final delivery write and will be reconciled safely: "
+                    + exception.getMessage());
             throw exception;
         }
 
