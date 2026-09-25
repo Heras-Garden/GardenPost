@@ -449,19 +449,22 @@ public final class MailService {
             }
             Block block = world.getBlockAt(record.mailboxX(), record.mailboxY(), record.mailboxZ());
             if (!(block.getState() instanceof Container container)) {
-                revertDelivering(record.id());
+                markReviewRequired(record.id(), "mailbox container is missing during interrupted delivery");
                 continue;
             }
 
             Set<Integer> parts = deliveredParts(container, record.id());
-            int expected = record.attachmentCount() + 1;
-            boolean complete = parts.contains(-1);
-            for (int i = 0; i < record.attachmentCount() && complete; i++) {
-                complete = parts.contains(i);
-            }
-            if (!complete || parts.size() != expected) {
-                removeDeliveredParts(container, record.id());
+            RecoveryDisposition disposition = recoveryDisposition(parts, record.attachmentCount());
+            if (disposition == RecoveryDisposition.SAFE_RETRY) {
                 revertDelivering(record.id());
+                continue;
+            }
+            if (disposition == RecoveryDisposition.REVIEW_REQUIRED) {
+                // Do not remove or recreate partial physical delivery. A player
+                // may already have taken one tagged part; retrying the full parcel
+                // would duplicate that attachment.
+                markReviewRequired(record.id(),
+                        "partial or mismatched physical parcel parts remain in the mailbox");
                 continue;
             }
             try (Connection connection = platform.storage().connection();
@@ -471,6 +474,29 @@ public final class MailService {
                 statement.setLong(1, System.currentTimeMillis());
                 statement.setString(2, record.id().toString());
                 statement.executeUpdate();
+            }
+        }
+    }
+
+    static RecoveryDisposition recoveryDisposition(Set<Integer> parts, int attachmentCount) {
+        if (parts == null || parts.isEmpty()) return RecoveryDisposition.SAFE_RETRY;
+        int expected = attachmentCount + 1;
+        boolean complete = parts.contains(-1);
+        for (int i = 0; i < attachmentCount && complete; i++) {
+            complete = parts.contains(i);
+        }
+        return complete && parts.size() == expected
+                ? RecoveryDisposition.FINALIZE_DELIVERED
+                : RecoveryDisposition.REVIEW_REQUIRED;
+    }
+
+    private void markReviewRequired(UUID mailId, String reason) throws SQLException {
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "UPDATE gp_mail SET status = 'REVIEW_REQUIRED' WHERE mail_uuid = ? AND status = 'DELIVERING'")) {
+            statement.setString(1, mailId.toString());
+            if (statement.executeUpdate() == 1) {
+                plugin.getLogger().severe("Mail " + mailId + " requires manual delivery review: " + reason + ".");
             }
         }
     }
@@ -514,6 +540,12 @@ public final class MailService {
             copy[i] = contents[i] == null ? null : contents[i].clone();
         }
         return copy;
+    }
+
+    enum RecoveryDisposition {
+        SAFE_RETRY,
+        FINALIZE_DELIVERED,
+        REVIEW_REQUIRED
     }
 
     private Optional<UUID> deliveredMailId(ItemStack item) {
