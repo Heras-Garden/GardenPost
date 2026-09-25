@@ -501,6 +501,81 @@ public final class MailService {
         }
     }
 
+    public List<ReviewInfo> reviewRequired(int limit) throws SQLException {
+        int safe = Math.max(1, Math.min(limit, 50));
+        List<ReviewInfo> out = new ArrayList<>();
+        try (Connection connection = platform.storage().connection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT * FROM gp_mail WHERE status='REVIEW_REQUIRED' ORDER BY created_at ASC LIMIT " + safe);
+             ResultSet result = statement.executeQuery()) {
+            while (result.next()) {
+                MailRecord record = read(result);
+                out.add(reviewInfo(record));
+            }
+        }
+        return List.copyOf(out);
+    }
+
+    public ReviewInfo reviewInfo(UUID mailId) throws SQLException {
+        MailRecord record = find(mailId).orElseThrow(() -> new IllegalArgumentException("That mail record does not exist."));
+        return reviewInfo(record);
+    }
+
+    private ReviewInfo reviewInfo(MailRecord record) {
+        org.bukkit.World world = Bukkit.getWorld(record.mailboxWorldId());
+        if (world == null) {
+            return new ReviewInfo(record, -1, record.attachmentCount() + 1, "WORLD_UNAVAILABLE");
+        }
+        Block block = world.getBlockAt(record.mailboxX(), record.mailboxY(), record.mailboxZ());
+        if (!(block.getState() instanceof Container container)) {
+            return new ReviewInfo(record, -1, record.attachmentCount() + 1, "MAILBOX_MISSING");
+        }
+        Set<Integer> parts = deliveredParts(container, record.id());
+        return new ReviewInfo(record, parts.size(), record.attachmentCount() + 1,
+                recoveryDisposition(parts, record.attachmentCount()).name());
+    }
+
+    public String resolveReview(UUID mailId, String action) throws SQLException {
+        MailRecord record = find(mailId).orElseThrow(() -> new IllegalArgumentException("That mail record does not exist."));
+        if (record.status() != MailStatus.REVIEW_REQUIRED) {
+            throw new IllegalArgumentException("That mail record is not waiting for review.");
+        }
+        String mode = action == null ? "" : action.trim().toLowerCase(java.util.Locale.ROOT);
+        ReviewInfo info = reviewInfo(record);
+        return switch (mode) {
+            case "retry" -> {
+                if (!"SAFE_RETRY".equals(info.disposition())) {
+                    throw new IllegalArgumentException("Retry is only allowed when zero tagged delivery parts remain.");
+                }
+                String next = record.assignedMailman() == null ? "PENDING" : "ASSIGNED";
+                try (Connection c = platform.storage().connection();
+                     PreparedStatement s = c.prepareStatement(
+                             "UPDATE gp_mail SET status=? WHERE mail_uuid=? AND status='REVIEW_REQUIRED'")) {
+                    s.setString(1, next); s.setString(2, mailId.toString()); s.executeUpdate();
+                }
+                yield "Mail returned to " + next.toLowerCase(java.util.Locale.ROOT) + " safely.";
+            }
+            case "delivered" -> {
+                try (Connection c = platform.storage().connection();
+                     PreparedStatement s = c.prepareStatement(
+                             "UPDATE gp_mail SET status='DELIVERED', delivered_at=COALESCE(delivered_at,?) "
+                                     + "WHERE mail_uuid=? AND status='REVIEW_REQUIRED'")) {
+                    s.setLong(1, System.currentTimeMillis()); s.setString(2, mailId.toString()); s.executeUpdate();
+                }
+                yield "Mail marked delivered after administrator review.";
+            }
+            case "cancel" -> {
+                try (Connection c = platform.storage().connection();
+                     PreparedStatement s = c.prepareStatement(
+                             "UPDATE gp_mail SET status='CANCELLED' WHERE mail_uuid=? AND status='REVIEW_REQUIRED'")) {
+                    s.setString(1, mailId.toString()); s.executeUpdate();
+                }
+                yield "Mail cancelled after administrator review. No automatic item recreation or refund was attempted.";
+            }
+            default -> throw new IllegalArgumentException("Review action must be retry, delivered, or cancel.");
+        };
+    }
+
     private void revertDelivering(UUID mailId) throws SQLException {
         try (Connection connection = platform.storage().connection();
              PreparedStatement statement = connection.prepareStatement(
@@ -820,6 +895,7 @@ public final class MailService {
                 .replace("\n", "\\n").replace("\r", "\\r");
     }
 
+    public record ReviewInfo(MailRecord record, int presentTaggedParts, int expectedTaggedParts, String disposition) {}
     public record Mailbox(UUID propertyId, UUID worldId, String worldName, int x, int y, int z, String address) {}
     public record Recipient(UUID playerId, String playerName, Mailbox mailbox) {}
     public record DeliveryResult(boolean success, String message) {
