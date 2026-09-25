@@ -44,16 +44,18 @@ public final class GardenPost extends JavaPlugin {
         }
 
         long postage = getConfig().getLong("postage.letter-cost", 2L);
+        long parcelPostage = getConfig().getLong("postage.parcel-cost", 5L);
         long courierReward = Math.max(0L, getConfig().getLong("courier.base-reward", 3L));
         long timeoutMinutes = Math.max(1L, getConfig().getLong("courier.assignment-timeout-minutes", 30L));
-        mailService = new MailService(this, platform, properties, postage, courierReward, timeoutMinutes * 60_000L);
+        mailService = new MailService(this, platform, properties, postage, parcelPostage, courierReward, timeoutMinutes * 60_000L);
         try {
             mailService.recoverInterruptedDeliveries();
         } catch (SQLException exception) {
             getLogger().warning("Interrupted mail delivery recovery could not complete: " + exception.getMessage());
         }
 
-        MailCommand mailCommand = new MailCommand(mailService);
+        ParcelSessionManager parcelSessions = new ParcelSessionManager(mailService);
+        MailCommand mailCommand = new MailCommand(mailService, parcelSessions);
         PluginCommand mail = getCommand("mail");
         if (mail != null) {
             mail.setExecutor(mailCommand);
@@ -61,8 +63,9 @@ public final class GardenPost extends JavaPlugin {
         }
 
         getServer().getPluginManager().registerEvents(new MailDeliveryListener(mailService), this);
+        getServer().getPluginManager().registerEvents(parcelSessions, this);
 
-        getLogger().info("GardenPost enabled. Postage, courier routes, and physical mailbox delivery are active.");
+        getLogger().info("GardenPost enabled. Letters, multi-stack parcels, courier routes, and crash-safe mailbox delivery are active.");
     }
 
     public MailService mail() {

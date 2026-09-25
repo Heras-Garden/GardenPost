@@ -3,6 +3,7 @@ package com.herasgarden.gardenpost.storage;
 import com.herasgarden.gardencore.api.storage.GardenStorage;
 
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 
@@ -26,11 +27,18 @@ public final class PostSchema {
                     + "mailbox_z INTEGER NOT NULL,"
                     + "address VARCHAR(192) NOT NULL,"
                     + "message TEXT NOT NULL,"
+                    + "attachment_data TEXT NULL,"
+                    + "attachment_count INTEGER NOT NULL DEFAULT 0,"
                     + "status VARCHAR(24) NOT NULL,"
                     + "assigned_mailman_uuid VARCHAR(36) NULL,"
                     + "created_at BIGINT NOT NULL,"
                     + "assigned_at BIGINT NULL,"
                     + "delivered_at BIGINT NULL)");
+            ensureColumn(connection, "gp_mail", "attachment_data",
+                    "ALTER TABLE gp_mail ADD COLUMN attachment_data TEXT NULL");
+            ensureColumn(connection, "gp_mail", "attachment_count",
+                    "ALTER TABLE gp_mail ADD COLUMN attachment_count INTEGER NOT NULL DEFAULT 0");
+
             statement.executeUpdate("CREATE INDEX IF NOT EXISTS idx_gp_mail_status "
                     + "ON gp_mail (status, created_at)");
             statement.executeUpdate("CREATE INDEX IF NOT EXISTS idx_gp_mail_recipient "
@@ -53,6 +61,15 @@ public final class PostSchema {
                     + "paid_at BIGINT NULL)");
             statement.executeUpdate("CREATE INDEX IF NOT EXISTS idx_gp_courier_rewards_mailman "
                     + "ON gp_courier_rewards (mailman_uuid, claimed_at)");
+        }
+    }
+
+    private static void ensureColumn(Connection connection, String table, String column, String ddl) throws SQLException {
+        try (ResultSet result = connection.getMetaData().getColumns(null, null, table, column)) {
+            if (result.next()) return;
+        }
+        try (Statement statement = connection.createStatement()) {
+            statement.executeUpdate(ddl);
         }
     }
 }

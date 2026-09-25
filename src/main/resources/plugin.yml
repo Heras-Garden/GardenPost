@@ -10,7 +10,7 @@ depend: [GardenCore, GardenLands]
 commands:
   mail:
     description: Send and deliver Garden mail.
-    usage: /mail <send|status|primary|route|routes>
+    usage: /mail <send|parcel|status|primary|route|routes>
 
 permissions:
   gardenpost.mail:

@@ -20,9 +20,11 @@ import java.util.Optional;
 
 public final class MailCommand implements CommandExecutor, TabCompleter {
     private final MailService mail;
+    private final ParcelSessionManager parcels;
 
-    public MailCommand(MailService mail) {
+    public MailCommand(MailService mail, ParcelSessionManager parcels) {
         this.mail = mail;
+        this.parcels = parcels;
     }
 
     @Override
@@ -43,6 +45,7 @@ public final class MailCommand implements CommandExecutor, TabCompleter {
         try {
             return switch (args[0].toLowerCase(Locale.ROOT)) {
                 case "send" -> sendMail(player, args);
+                case "parcel" -> parcel(player, args);
                 case "status" -> status(player);
                 case "primary" -> primary(player);
                 case "route" -> route(player);
@@ -77,6 +80,21 @@ public final class MailCommand implements CommandExecutor, TabCompleter {
         send(sender, "Letter " + record.id().toString().substring(0, 8)
                 + " accepted for " + record.recipientName() + " at " + record.address()
                 + ". Postage: " + mail.postageCost() + " Obols.");
+        return true;
+    }
+
+    private boolean parcel(Player sender, String[] args) throws SQLException {
+        if (args.length < 3) {
+            send(sender, "Use /mail parcel <player> <message>.");
+            return true;
+        }
+        Optional<MailService.Recipient> recipient = mail.resolveRecipient(args[1]);
+        if (recipient.isEmpty()) {
+            send(sender, "That player has not joined The Garden SMP before.");
+            return true;
+        }
+        String message = String.join(" ", Arrays.copyOfRange(args, 2, args.length));
+        parcels.open(sender, recipient.get(), message);
         return true;
     }
 
@@ -153,7 +171,7 @@ public final class MailCommand implements CommandExecutor, TabCompleter {
     }
 
     private void help(Player player) {
-        send(player, "/mail send <player> <message>, /mail status, /mail primary"
+        send(player, "/mail send <player> <message>, /mail parcel <player> <message>, /mail status, /mail primary"
                 + (player.hasPermission("gardenpost.mailman") || player.hasPermission("gardenpost.admin")
                 ? ", /mail route, /mail routes" : ""));
     }
@@ -166,12 +184,12 @@ public final class MailCommand implements CommandExecutor, TabCompleter {
     public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
         if (args.length == 1) {
             List<String> values = sender.hasPermission("gardenpost.mailman") || sender.hasPermission("gardenpost.admin")
-                    ? List.of("send", "status", "primary", "route", "routes")
-                    : List.of("send", "status", "primary");
+                    ? List.of("send", "parcel", "status", "primary", "route", "routes")
+                    : List.of("send", "parcel", "status", "primary");
             String prefix = args[0].toLowerCase(Locale.ROOT);
             return values.stream().filter(value -> value.startsWith(prefix)).toList();
         }
-        if (args.length == 2 && args[0].equalsIgnoreCase("send")) {
+        if (args.length == 2 && (args[0].equalsIgnoreCase("send") || args[0].equalsIgnoreCase("parcel"))) {
             String prefix = args[1].toLowerCase(Locale.ROOT);
             return Arrays.stream(Bukkit.getOfflinePlayers())
                     .map(p -> p.getName())
