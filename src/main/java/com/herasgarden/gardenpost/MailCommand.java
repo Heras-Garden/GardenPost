@@ -17,6 +17,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.UUID;
 
 public final class MailCommand implements CommandExecutor, TabCompleter {
     private final MailService mail;
@@ -50,6 +51,7 @@ public final class MailCommand implements CommandExecutor, TabCompleter {
                 case "primary" -> primary(player);
                 case "route" -> route(player);
                 case "routes" -> routes(player);
+                case "review" -> review(player, args);
                 default -> {
                     help(player);
                     yield true;
@@ -170,10 +172,46 @@ public final class MailCommand implements CommandExecutor, TabCompleter {
         return true;
     }
 
+    private boolean review(Player player, String[] args) throws SQLException {
+        if (!player.hasPermission("gardenpost.admin")) {
+            send(player, "Only Garden administrators can review ambiguous deliveries.");
+            return true;
+        }
+        if (args.length == 1) {
+            List<MailService.ReviewInfo> records = mail.reviewRequired(20);
+            if (records.isEmpty()) {
+                send(player, "There are no mail deliveries waiting for review.");
+                return true;
+            }
+            player.sendMessage(Component.text("[Server] Mail delivery review", NamedTextColor.GRAY));
+            for (MailService.ReviewInfo info : records) {
+                MailRecord record = info.record();
+                player.sendMessage(Component.text(
+                        record.id().toString().substring(0, 8) + " | " + record.recipientName()
+                                + " | parts " + info.presentTaggedParts() + "/" + info.expectedTaggedParts()
+                                + " | " + info.disposition().toLowerCase(Locale.ROOT),
+                        NamedTextColor.WHITE));
+            }
+            return true;
+        }
+        UUID id = UUID.fromString(args[1]);
+        if (args.length == 2 || args[2].equalsIgnoreCase("info")) {
+            MailService.ReviewInfo info = mail.reviewInfo(id);
+            MailRecord record = info.record();
+            send(player, "Mail " + record.id() + " | " + record.recipientName() + " | "
+                    + info.presentTaggedParts() + "/" + info.expectedTaggedParts()
+                    + " tagged parts | " + info.disposition() + ".");
+            return true;
+        }
+        send(player, mail.resolveReview(id, args[2]));
+        return true;
+    }
+
     private void help(Player player) {
         send(player, "/mail send <player> <message>, /mail parcel <player> <message>, /mail status, /mail primary"
                 + (player.hasPermission("gardenpost.mailman") || player.hasPermission("gardenpost.admin")
-                ? ", /mail route, /mail routes" : ""));
+                ? ", /mail route, /mail routes" : "")
+                + (player.hasPermission("gardenpost.admin") ? ", /mail review [mail-uuid] [info|retry|delivered|cancel]" : ""));
     }
 
     private void send(CommandSender sender, String message) {
@@ -184,7 +222,9 @@ public final class MailCommand implements CommandExecutor, TabCompleter {
     public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
         if (args.length == 1) {
             List<String> values = sender.hasPermission("gardenpost.mailman") || sender.hasPermission("gardenpost.admin")
-                    ? List.of("send", "parcel", "status", "primary", "route", "routes")
+                    ? (sender.hasPermission("gardenpost.admin")
+                        ? List.of("send", "parcel", "status", "primary", "route", "routes", "review")
+                        : List.of("send", "parcel", "status", "primary", "route", "routes"))
                     : List.of("send", "parcel", "status", "primary");
             String prefix = args[0].toLowerCase(Locale.ROOT);
             return values.stream().filter(value -> value.startsWith(prefix)).toList();
