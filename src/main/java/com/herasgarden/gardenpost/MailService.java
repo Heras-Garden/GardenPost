@@ -28,9 +28,12 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.Base64;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 public final class MailService {
@@ -38,25 +41,33 @@ public final class MailService {
     private final GardenPlatform platform;
     private final PropertyDirectory properties;
     private final long postageCost;
+    private final long parcelPostageCost;
     private final long courierReward;
     private final long assignmentTimeoutMillis;
     private final NamespacedKey routeKey;
     private final NamespacedKey deliveredKey;
+    private final NamespacedKey deliveredPartKey;
 
     public MailService(JavaPlugin plugin, GardenPlatform platform, PropertyDirectory properties,
-                       long postageCost, long courierReward, long assignmentTimeoutMillis) {
+                       long postageCost, long parcelPostageCost, long courierReward, long assignmentTimeoutMillis) {
         this.plugin = plugin;
         this.platform = platform;
         this.properties = properties;
         this.postageCost = Math.max(0L, postageCost);
+        this.parcelPostageCost = Math.max(this.postageCost, parcelPostageCost);
         this.courierReward = Math.max(0L, courierReward);
         this.assignmentTimeoutMillis = Math.max(60_000L, assignmentTimeoutMillis);
         this.routeKey = new NamespacedKey(plugin, "mail-route-id");
         this.deliveredKey = new NamespacedKey(plugin, "delivered-mail-id");
+        this.deliveredPartKey = new NamespacedKey(plugin, "delivered-mail-part");
     }
 
     public long postageCost() {
         return postageCost;
+    }
+
+    public long parcelPostageCost() {
+        return parcelPostageCost;
     }
 
     public Optional<Recipient> resolveRecipient(String name) throws SQLException {
@@ -120,33 +131,58 @@ public final class MailService {
     }
 
     public MailRecord send(Player sender, Recipient recipient, String message) throws SQLException {
+        return sendInternal(sender, recipient, message, List.of(), postageCost, "Letter");
+    }
+
+    public MailRecord sendParcel(Player sender, Recipient recipient, String message, List<ItemStack> attachments)
+            throws SQLException {
+        List<ItemStack> clean = attachments == null ? List.of() : attachments.stream()
+                .filter(item -> item != null && !item.getType().isAir() && item.getAmount() > 0)
+                .map(ItemStack::clone)
+                .limit(9)
+                .toList();
+        if (clean.isEmpty()) {
+            throw new IllegalArgumentException("Put at least one item stack in the parcel.");
+        }
+        return sendInternal(sender, recipient, message, clean, parcelPostageCost, "Parcel");
+    }
+
+    private MailRecord sendInternal(
+            Player sender,
+            Recipient recipient,
+            String message,
+            List<ItemStack> attachments,
+            long cost,
+            String kind
+    ) throws SQLException {
         String cleanMessage = cleanMessage(message);
         if (cleanMessage.isBlank()) {
-            throw new IllegalArgumentException("A letter needs a message.");
+            throw new IllegalArgumentException("Mail needs a message.");
         }
         if (recipient.playerId().equals(sender.getUniqueId())) {
-            throw new IllegalArgumentException("You cannot mail a letter to yourself.");
+            throw new IllegalArgumentException("You cannot mail yourself.");
         }
 
+        String attachmentData = encodeAttachments(attachments);
+        int attachmentCount = attachments.size();
         UUID mailId = UUID.randomUUID();
         GardenOrder order = platform.orders().create(
                 OrderType.POSTAGE,
                 sender.getUniqueId(),
                 "SERVER",
                 "garden-post",
-                postageCost,
+                cost,
                 "gardenpost.mail",
                 mailId.toString(),
-                "{\"recipientUuid\":\"" + recipient.playerId() + "\"}"
+                "{\"recipientUuid\":\"" + recipient.playerId() + "\",\"parcel\":" + (attachmentCount > 0) + "}"
         );
-        platform.orders().transition(order.id(), OrderState.READY, "Letter prepared");
-        platform.orders().transition(order.id(), OrderState.AWAITING_CONFIRMATION, "Send command confirms postage");
+        platform.orders().transition(order.id(), OrderState.READY, kind + " prepared");
+        platform.orders().transition(order.id(), OrderState.AWAITING_CONFIRMATION, "Sender confirmed mail");
         platform.orders().transition(order.id(), OrderState.PAYMENT_PENDING, "Collecting postage");
 
-        if (!platform.currency().withdraw(sender.getUniqueId(), postageCost)) {
+        if (!platform.currency().withdraw(sender.getUniqueId(), cost)) {
             platform.orders().transition(order.id(), OrderState.PAYMENT_FAILED, "Insufficient Obols for postage");
-            throw new IllegalArgumentException("You need " + platform.currency().symbol() + " "
-                    + postageCost + " for postage.");
+            throw new IllegalArgumentException("You need " + platform.currency().symbol() + " " + cost + " for postage.");
         }
 
         platform.orders().transition(order.id(), OrderState.PAID, "Postage paid");
@@ -158,13 +194,14 @@ public final class MailService {
                 mailId, order.id(), sender.getUniqueId(), sender.getName(),
                 recipient.playerId(), recipient.playerName(), mailbox.propertyId(),
                 mailbox.worldId(), mailbox.worldName(), mailbox.x(), mailbox.y(), mailbox.z(),
-                mailbox.address(), cleanMessage, MailStatus.PENDING, null, now, null, null
+                mailbox.address(), cleanMessage, attachmentData, attachmentCount,
+                MailStatus.PENDING, null, now, null, null
         );
 
         try {
             insert(record);
         } catch (SQLException exception) {
-            boolean refunded = platform.currency().deposit(sender.getUniqueId(), postageCost);
+            boolean refunded = platform.currency().deposit(sender.getUniqueId(), cost);
             try {
                 platform.orders().transition(order.id(),
                         refunded ? OrderState.REFUNDED : OrderState.FULFILLMENT_FAILED,
@@ -179,7 +216,6 @@ public final class MailService {
             }
             throw exception;
         }
-
         return record;
     }
 
@@ -259,7 +295,9 @@ public final class MailService {
         meta.displayName(Component.text("Garden Mail: " + record.recipientName(), NamedTextColor.WHITE));
         meta.lore(List.of(
                 Component.text(record.address(), NamedTextColor.GRAY),
-                Component.text("Deliver to the registered mailbox.", NamedTextColor.GRAY),
+                Component.text(record.parcel()
+                        ? "Parcel: " + record.attachmentCount() + " item stack(s)"
+                        : "Deliver to the registered mailbox.", NamedTextColor.GRAY),
                 Component.text("Mail " + record.id().toString().substring(0, 8), NamedTextColor.DARK_GRAY)
         ));
         meta.getPersistentDataContainer().set(routeKey, PersistentDataType.STRING, record.id().toString());
@@ -306,11 +344,20 @@ public final class MailService {
             }
         }
 
-        ItemStack letter = deliveredLetter(record);
-        Map<Integer, ItemStack> leftovers = container.getInventory().addItem(letter);
-        if (!leftovers.isEmpty()) {
+        ItemStack[] snapshot = cloneContents(container.getInventory().getContents());
+        List<ItemStack> deliveryItems;
+        try {
+            deliveryItems = deliveryItems(record);
+        } catch (IllegalArgumentException exception) {
             revertDelivering(record.id());
-            return DeliveryResult.failure("That mailbox is full.");
+            return DeliveryResult.failure("That parcel data is damaged and needs administrator review.");
+        }
+        Map<Integer, ItemStack> leftovers = container.getInventory()
+                .addItem(deliveryItems.toArray(ItemStack[]::new));
+        if (!leftovers.isEmpty()) {
+            container.getInventory().setContents(snapshot);
+            revertDelivering(record.id());
+            return DeliveryResult.failure("That mailbox does not have enough room for this delivery.");
         }
 
         try {
@@ -321,7 +368,7 @@ public final class MailService {
                 statement.setLong(1, now);
                 statement.setString(2, record.id().toString());
                 if (statement.executeUpdate() != 1) {
-                    removeOneDeliveredLetter(container, record.id());
+                    removeDeliveredParts(container, record.id());
                     revertDelivering(record.id());
                     return DeliveryResult.failure("The delivery changed before it could be completed.");
                 }
@@ -352,7 +399,7 @@ public final class MailService {
         }
 
         try {
-            String detail = "Letter delivered to mailbox";
+            String detail = (record.parcel() ? "Parcel" : "Letter") + " delivered to mailbox";
             if (rewardPaid) {
                 detail += "; courier reward " + platform.currency().symbol() + " " + courierReward
                         + " paid to " + mailman.getName();
@@ -406,14 +453,16 @@ public final class MailService {
                 continue;
             }
 
-            int copies = countDeliveredLetters(container, record.id());
-            if (copies <= 0) {
+            Set<Integer> parts = deliveredParts(container, record.id());
+            int expected = record.attachmentCount() + 1;
+            boolean complete = parts.contains(-1);
+            for (int i = 0; i < record.attachmentCount() && complete; i++) {
+                complete = parts.contains(i);
+            }
+            if (!complete || parts.size() != expected) {
+                removeDeliveredParts(container, record.id());
                 revertDelivering(record.id());
                 continue;
-            }
-            while (copies > 1) {
-                if (!removeOneDeliveredLetter(container, record.id())) break;
-                copies--;
             }
             try (Connection connection = platform.storage().connection();
                  PreparedStatement statement = connection.prepareStatement(
@@ -435,24 +484,36 @@ public final class MailService {
         }
     }
 
-    private int countDeliveredLetters(Container container, UUID mailId) {
-        int count = 0;
+    private Set<Integer> deliveredParts(Container container, UUID mailId) {
+        Set<Integer> parts = new HashSet<>();
         for (ItemStack item : container.getInventory().getContents()) {
-            if (deliveredMailId(item).filter(mailId::equals).isPresent()) count += item.getAmount();
+            if (deliveredMailId(item).filter(mailId::equals).isEmpty() || item == null || !item.hasItemMeta()) continue;
+            String raw = item.getItemMeta().getPersistentDataContainer().get(deliveredPartKey, PersistentDataType.STRING);
+            if (raw == null) continue;
+            try {
+                parts.add(Integer.parseInt(raw));
+            } catch (NumberFormatException ignored) {
+            }
         }
-        return count;
+        return parts;
     }
 
-    private boolean removeOneDeliveredLetter(Container container, UUID mailId) {
+    private void removeDeliveredParts(Container container, UUID mailId) {
         ItemStack[] contents = container.getInventory().getContents();
         for (int slot = 0; slot < contents.length; slot++) {
             ItemStack item = contents[slot];
-            if (deliveredMailId(item).filter(mailId::equals).isEmpty()) continue;
-            if (item.getAmount() <= 1) container.getInventory().setItem(slot, null);
-            else item.setAmount(item.getAmount() - 1);
-            return true;
+            if (deliveredMailId(item).filter(mailId::equals).isPresent()) {
+                container.getInventory().setItem(slot, null);
+            }
         }
-        return false;
+    }
+
+    private ItemStack[] cloneContents(ItemStack[] contents) {
+        ItemStack[] copy = new ItemStack[contents.length];
+        for (int i = 0; i < contents.length; i++) {
+            copy[i] = contents[i] == null ? null : contents[i].clone();
+        }
+        return copy;
     }
 
     private Optional<UUID> deliveredMailId(ItemStack item) {
@@ -464,6 +525,24 @@ public final class MailService {
         } catch (IllegalArgumentException ignored) {
             return Optional.empty();
         }
+    }
+
+    private List<ItemStack> deliveryItems(MailRecord record) {
+        List<ItemStack> items = new ArrayList<>();
+        items.add(deliveredLetter(record));
+        List<ItemStack> attachments = decodeAttachments(record.attachmentData());
+        if (attachments.size() != record.attachmentCount()) {
+            throw new IllegalArgumentException("Attachment count mismatch");
+        }
+        for (int i = 0; i < attachments.size(); i++) {
+            ItemStack item = attachments.get(i).clone();
+            ItemMeta meta = item.getItemMeta();
+            meta.getPersistentDataContainer().set(deliveredKey, PersistentDataType.STRING, record.id().toString());
+            meta.getPersistentDataContainer().set(deliveredPartKey, PersistentDataType.STRING, Integer.toString(i));
+            item.setItemMeta(meta);
+            items.add(item);
+        }
+        return items;
     }
 
     private ItemStack deliveredLetter(MailRecord record) {
@@ -480,6 +559,7 @@ public final class MailService {
         }
         meta.lore(lore);
         meta.getPersistentDataContainer().set(deliveredKey, PersistentDataType.STRING, record.id().toString());
+        meta.getPersistentDataContainer().set(deliveredPartKey, PersistentDataType.STRING, "-1");
         item.setItemMeta(meta);
         return item;
     }
@@ -538,8 +618,8 @@ public final class MailService {
                      "INSERT INTO gp_mail "
                              + "(mail_uuid, order_uuid, sender_uuid, sender_name, recipient_uuid, recipient_name, "
                              + "property_uuid, mailbox_world_uuid, mailbox_world_name, mailbox_x, mailbox_y, mailbox_z, "
-                             + "address, message, status, assigned_mailman_uuid, created_at, assigned_at, delivered_at) "
-                             + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL)")) {
+                             + "address, message, attachment_data, attachment_count, status, assigned_mailman_uuid, created_at, assigned_at, delivered_at) "
+                             + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL)")) {
             statement.setString(1, record.id().toString());
             statement.setString(2, record.orderId().toString());
             statement.setString(3, record.senderId().toString());
@@ -554,8 +634,10 @@ public final class MailService {
             statement.setInt(12, record.mailboxZ());
             statement.setString(13, record.address());
             statement.setString(14, record.message());
-            statement.setString(15, record.status().name());
-            statement.setLong(16, record.createdAt());
+            statement.setString(15, record.attachmentData());
+            statement.setInt(16, record.attachmentCount());
+            statement.setString(17, record.status().name());
+            statement.setLong(18, record.createdAt());
             statement.executeUpdate();
         }
     }
@@ -646,12 +728,37 @@ public final class MailService {
                 result.getInt("mailbox_z"),
                 result.getString("address"),
                 result.getString("message"),
+                result.getString("attachment_data"),
+                result.getInt("attachment_count"),
                 MailStatus.valueOf(result.getString("status")),
                 mailman == null ? null : UUID.fromString(mailman),
                 result.getLong("created_at"),
                 assignedAt == null ? null : result.getLong("assigned_at"),
                 deliveredAt == null ? null : result.getLong("delivered_at")
         );
+    }
+
+    private String encodeAttachments(List<ItemStack> attachments) {
+        if (attachments == null || attachments.isEmpty()) return null;
+        return attachments.stream()
+                .map(ItemStack::serializeAsBytes)
+                .map(Base64.getEncoder()::encodeToString)
+                .reduce((a, b) -> a + ";" + b)
+                .orElse(null);
+    }
+
+    private List<ItemStack> decodeAttachments(String encoded) {
+        if (encoded == null || encoded.isBlank()) return List.of();
+        List<ItemStack> items = new ArrayList<>();
+        for (String part : encoded.split(";")) {
+            if (part.isBlank()) continue;
+            try {
+                items.add(ItemStack.deserializeBytes(Base64.getDecoder().decode(part)));
+            } catch (RuntimeException exception) {
+                throw new IllegalArgumentException("Invalid parcel attachment data", exception);
+            }
+        }
+        return List.copyOf(items);
     }
 
     private String cleanMessage(String message) {

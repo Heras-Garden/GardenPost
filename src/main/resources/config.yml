@@ -1,5 +1,6 @@
 postage:
   letter-cost: 2
+  parcel-cost: 5
 
 courier:
   base-reward: 3

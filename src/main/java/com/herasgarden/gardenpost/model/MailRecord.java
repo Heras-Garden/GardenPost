@@ -17,10 +17,15 @@ public record MailRecord(
         int mailboxZ,
         String address,
         String message,
+        String attachmentData,
+        int attachmentCount,
         MailStatus status,
         UUID assignedMailman,
         long createdAt,
         Long assignedAt,
         Long deliveredAt
 ) {
+    public boolean parcel() {
+        return attachmentCount > 0;
+    }
 }
